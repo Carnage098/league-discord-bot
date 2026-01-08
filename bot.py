@@ -217,7 +217,7 @@ async def apply_draw(league_id: int, p1_id: str, p2_id: str):
         )
 
 # =========================
-# Confirmation view (report_match)
+# Confirmation view (reportmatch)
 # =========================
 class ConfirmMatchView(discord.ui.View):
     def __init__(self, pending_id: int, opponent_id: int):
@@ -238,14 +238,14 @@ class ConfirmMatchView(discord.ui.View):
             self.disable_all_items()
             return await interaction.response.edit_message(content="ℹ️ Ce match n’est plus en attente.", view=self)
 
-        # Safety: league still open?
+        # league still open?
         league = await db_one(bot.db, "SELECT * FROM leagues WHERE id=?", (p["league_id"],))
         if not league or league["status"] != "open":
             await db_exec(bot.db, "DELETE FROM pending_matches WHERE id=?", (self.pending_id,))
             self.disable_all_items()
             return await interaction.response.edit_message(content="❌ Ligue fermée : confirmation impossible.", view=self)
 
-        # Must still be registered
+        # Still registered?
         reporter_id = int(p["reporter_id"])
         opponent_id = int(p["opponent_id"])
         if not await is_player(p["league_id"], str(reporter_id)) or not await is_player(p["league_id"], str(opponent_id)):
@@ -266,14 +266,12 @@ class ConfirmMatchView(discord.ui.View):
             loser_id = str(p["loser_id"])
             await apply_win(p["league_id"], winner_id, loser_id)
 
-            # Store match with p1 = winner, p2 = loser
             await db_exec(
                 bot.db,
                 "INSERT INTO matches (league_id, p1, p2, result, created_at, p1_deck, p2_deck) VALUES (?,?,?,?,?,?,?)",
                 (p["league_id"], winner_id, loser_id, "win", p["created_at"], p["p1_deck"], p["p2_deck"]),
             )
         else:
-            # draw: keep p1=reporter, p2=opponent (as submitted)
             await apply_draw(p["league_id"], str(p["reporter_id"]), str(p["opponent_id"]))
             await db_exec(
                 bot.db,
@@ -283,7 +281,6 @@ class ConfirmMatchView(discord.ui.View):
 
         await db_exec(bot.db, "DELETE FROM pending_matches WHERE id=?", (self.pending_id,))
         self.disable_all_items()
-
         await interaction.response.edit_message(content="✅ Match confirmé et enregistré !", view=self)
 
     @discord.ui.button(label="❌ Refuser", style=discord.ButtonStyle.danger)
@@ -369,7 +366,7 @@ async def leaveleague(interaction: discord.Interaction):
         "DELETE FROM players WHERE league_id=? AND user_id=?",
         (league["id"], str(interaction.user.id)),
     )
-    await interaction.response.send_message("🚪 Tu as quitté la ligue. Tes stats sont conservées (tu ne peux plus déclarer de match).")
+    await interaction.response.send_message("🚪 Tu as quitté la ligue. Tes stats sont conservées.")
 
 @bot.tree.command(name="league_leaderboard", description="Afficher le classement")
 async def league_leaderboard(interaction: discord.Interaction):
@@ -467,7 +464,6 @@ async def admin_reset_league(interaction: discord.Interaction):
     if not league:
         return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
 
-    # Reset only current league data (keeps deck directory)
     await db_exec(bot.db, "DELETE FROM matches WHERE league_id=?", (league["id"],))
     await db_exec(bot.db, "DELETE FROM standings WHERE league_id=?", (league["id"],))
     await db_exec(bot.db, "DELETE FROM players WHERE league_id=?", (league["id"],))
@@ -559,7 +555,6 @@ async def winversus(
     deck_gagnant = deck_gagnant.strip()
     deck_adverse = deck_adverse.strip()
 
-    # Auto-add to deck directory
     await upsert_deck(interaction.guild_id, deck_gagnant)
     await upsert_deck(interaction.guild_id, deck_adverse)
 
@@ -625,57 +620,33 @@ async def drawversus(
     )
 
 # =========================
-# Slash commands: Confirmation flow (optional)
+# Slash commands: Confirmation flow (optional) - FIXED
 # =========================
-class ResultType(app_commands.Transform):
-    pass
-
-@bot.tree.command(name="report_match", description="Déclarer un match à confirmer par l'adversaire (optionnel)")
-@app_commands.autocomplete(deck_moi=deck_autocomplete, deck_adverse=deck_autocomplete)
-async def report_match(
-    interaction: discord.Interaction,
-    adversaire: discord.User,
-    resultat: app_commands.Choice[str],  # 'win' or 'draw'
-    deck_moi: str,
-    deck_adverse: str,
-    victoire_de: app_commands.Choice[str] | None = None,  # 'moi'/'adversaire' si resultat='win'
-):
-    """
-    Note: Discord Choice needs to be provided via autocomplete-like selection.
-    We'll populate choices using app_commands.choices below.
-    """
-    await interaction.response.send_message("❌ Cette commande n'a pas été initialisée correctement.", ephemeral=True)
-
-@report_match.autocomplete("resultat")
 async def _auto_resultat(interaction: discord.Interaction, current: str):
-    choices = [
-        app_commands.Choice(name="🏆 Victoire", value="win"),
-        app_commands.Choice(name="🤝 Égalité", value="draw"),
-    ]
+    # returning Choice is OK here because the PARAMETER is str, not Choice[]
+    choices = ["win", "draw"]
     cur = (current or "").lower()
-    return [c for c in choices if cur in c.value or cur in c.name.lower()][:25]
+    return [app_commands.Choice(name=c, value=c) for c in choices if cur in c][:25]
 
-@report_match.autocomplete("victoire_de")
 async def _auto_victoire_de(interaction: discord.Interaction, current: str):
-    choices = [
-        app_commands.Choice(name="Moi", value="moi"),
-        app_commands.Choice(name="Adversaire", value="adversaire"),
-    ]
+    choices = ["moi", "adversaire"]
     cur = (current or "").lower()
-    return [c for c in choices if cur in c.value or cur in c.name.lower()][:25]
-
-# Re-define properly (Discord doesn't let us easily declare Choice params with dynamic choices in signature cleanly)
-# We'll register a second command name to avoid confusion in some environments.
+    return [app_commands.Choice(name=c, value=c) for c in choices if cur in c][:25]
 
 @bot.tree.command(name="reportmatch", description="Déclarer un match à confirmer (win/draw)")
-@app_commands.autocomplete(deck_moi=deck_autocomplete, deck_adverse=deck_autocomplete, resultat=_auto_resultat, victoire_de=_auto_victoire_de)
+@app_commands.autocomplete(
+    deck_moi=deck_autocomplete,
+    deck_adverse=deck_autocomplete,
+    resultat=_auto_resultat,
+    victoire_de=_auto_victoire_de
+)
 async def reportmatch(
     interaction: discord.Interaction,
     adversaire: discord.User,
-    resultat: str,          # 'win' ou 'draw'
+    resultat: str,           # 'win' ou 'draw'
     deck_moi: str,
     deck_adverse: str,
-    victoire_de: str = "moi"  # 'moi' ou 'adversaire' (utilisé seulement si resultat='win')
+    victoire_de: str = "moi" # 'moi' ou 'adversaire' (utilisé seulement si resultat='win')
 ):
     if adversaire.id == interaction.user.id:
         return await interaction.response.send_message("❌ Impossible contre toi-même", ephemeral=True)
@@ -699,7 +670,6 @@ async def reportmatch(
     deck_moi = deck_moi.strip()
     deck_adverse = deck_adverse.strip()
 
-    # For win, decide winner/loser
     reporter_id = interaction.user.id
     opponent_id = adversaire.id
 
@@ -724,11 +694,9 @@ async def reportmatch(
             p1_deck = deck_adverse
             p2_deck = deck_moi
     else:
-        # draw: store as reporter/opponent order with their decks
         p1_deck = deck_moi
         p2_deck = deck_adverse
 
-    # Insert pending
     await db_exec(
         bot.db,
         """
@@ -753,13 +721,12 @@ async def reportmatch(
     pending = await db_one(bot.db, "SELECT id FROM pending_matches ORDER BY id DESC LIMIT 1")
     pending_id = int(pending["id"])
 
-    # Send confirmation to opponent
     view = ConfirmMatchView(pending_id=pending_id, opponent_id=opponent_id)
 
     if resultat == "win":
         msg = (
             f"📨 <@{reporter_id}> a reporté un match.\n"
-            f"Résultat: 🏆 **Victoire de {'<@'+str(winner_id)+'>'}**\n"
+            f"Résultat: 🏆 **Victoire de <@{winner_id}>**\n"
             f"Decks: **{p1_deck}** vs **{p2_deck}**\n\n"
             f"<@{opponent_id}>, confirme ou refuse :"
         )
@@ -791,7 +758,6 @@ async def my_stats(interaction: discord.Interaction):
     total = int(row["wins"]) + int(row["draws"]) + int(row["losses"])
     winrate = (int(row["wins"]) / total * 100) if total > 0 else 0.0
 
-    # Top decks played by this user (as p1 or p2)
     decks_rows = await db_all(
         bot.db,
         """
@@ -851,7 +817,6 @@ async def h2h(interaction: discord.Interaction, adversaire: discord.User):
         if m["result"] == "draw":
             d += 1
         else:
-            # p1 is winner
             if m["p1"] == me:
                 w += 1
             elif m["p2"] == me:
@@ -886,7 +851,6 @@ async def deck_stats(interaction: discord.Interaction, deck: str):
     if not deck:
         return await interaction.response.send_message("❌ Deck invalide.", ephemeral=True)
 
-    # games, wins, draws, losses for the deck
     stats = await db_one(
         bot.db,
         """
@@ -911,7 +875,6 @@ async def deck_stats(interaction: discord.Interaction, deck: str):
     draws = int(stats["draws"] or 0)
     winrate = (wins / games * 100) if games > 0 else 0.0
 
-    # Matchups summary: opponent deck vs this deck (wins/losses/draws)
     matchup_rows = await db_all(
         bot.db,
         """
@@ -921,7 +884,6 @@ async def deck_stats(interaction: discord.Interaction, deck: str):
                SUM(d) AS draws,
                SUM(w + l + d) AS games
         FROM (
-            -- deck is p1_deck
             SELECT p2_deck AS opp_deck,
                    CASE WHEN result='win' THEN 1 ELSE 0 END AS w,
                    0 AS l,
@@ -931,7 +893,6 @@ async def deck_stats(interaction: discord.Interaction, deck: str):
 
             UNION ALL
 
-            -- deck is p2_deck
             SELECT p1_deck AS opp_deck,
                    0 AS w,
                    CASE WHEN result='win' THEN 1 ELSE 0 END AS l,
@@ -977,20 +938,12 @@ async def deck_matchups(interaction: discord.Interaction, deck_a: str, deck_b: s
     if not valid:
         return await interaction.response.send_message(err, ephemeral=True)
 
-    # Count games where A vs B (either side)
     rows = await db_one(
         bot.db,
         """
         SELECT
-          SUM(CASE
-                WHEN result='win' AND p1_deck=? AND p2_deck=? THEN 1
-                WHEN result='win' AND p1_deck=? AND p2_deck=? THEN 0
-                ELSE 0
-              END) AS a_wins_direct,
-          SUM(CASE
-                WHEN result='win' AND p1_deck=? AND p2_deck=? THEN 1
-                ELSE 0
-              END) AS b_wins_direct,
+          SUM(CASE WHEN result='win' AND p1_deck=? AND p2_deck=? THEN 1 ELSE 0 END) AS a_wins,
+          SUM(CASE WHEN result='win' AND p1_deck=? AND p2_deck=? THEN 1 ELSE 0 END) AS b_wins,
           SUM(CASE WHEN result='draw' AND ((p1_deck=? AND p2_deck=?) OR (p1_deck=? AND p2_deck=?)) THEN 1 ELSE 0 END) AS draws,
           COUNT(*) AS games
         FROM matches
@@ -1001,10 +954,9 @@ async def deck_matchups(interaction: discord.Interaction, deck_a: str, deck_b: s
           )
         """,
         (
-            deck_a, deck_b,  # a_wins_direct: A is p1
-            deck_b, deck_a,  # a_wins_direct: if B is p1 then A didn't win there
-            deck_b, deck_a,  # b_wins_direct: B is p1
-            deck_a, deck_b, deck_b, deck_a,  # draws
+            deck_a, deck_b,
+            deck_b, deck_a,
+            deck_a, deck_b, deck_b, deck_a,
             league["id"],
             deck_a, deck_b, deck_b, deck_a,
         ),
@@ -1014,8 +966,8 @@ async def deck_matchups(interaction: discord.Interaction, deck_a: str, deck_b: s
     if games == 0:
         return await interaction.response.send_message("ℹ️ Aucun match entre ces deux decks (dans la ligue ouverte).")
 
-    a_wins = int(rows["a_wins_direct"] or 0)
-    b_wins = int(rows["b_wins_direct"] or 0)
+    a_wins = int(rows["a_wins"] or 0)
+    b_wins = int(rows["b_wins"] or 0)
     draws = int(rows["draws"] or 0)
 
     a_winrate = (a_wins / games * 100) if games else 0.0
@@ -1063,7 +1015,6 @@ async def export_matches(interaction: discord.Interaction):
     )
     dict_rows = [dict(r) for r in rows]
     file = _csv_file("matches.csv", dict_rows)
-
     await interaction.response.send_message("📤 Export des matchs :", file=file)
 
 @bot.tree.command(name="export_standings", description="Exporter le classement en CSV (admin)")
@@ -1085,7 +1036,6 @@ async def export_standings(interaction: discord.Interaction):
     )
     dict_rows = [dict(r) for r in rows]
     file = _csv_file("standings.csv", dict_rows)
-
     await interaction.response.send_message("📤 Export du classement :", file=file)
 
 # =========================
