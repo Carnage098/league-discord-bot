@@ -2,6 +2,8 @@ import os
 import time
 import io
 import csv
+from typing import Optional
+
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -11,11 +13,13 @@ import aiosqlite
 # Config
 # =========================
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")  # optionnel (sync plus rapide si tu mets l'ID du serveur)
+GUILD_ID = os.getenv("GUILD_ID")  # optionnel (sync instant si tu mets l'ID du serveur)
 DB_PATH = "league.sqlite"
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN manquant (Railway > Variables)")
+
+FORMATS = ["Genesys", "Compétitif", "Chill"]
 
 def now() -> int:
     return int(time.time())
@@ -48,21 +52,23 @@ intents.guilds = True
 class LeagueBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
-        self.db: aiosqlite.Connection | None = None
+        self.db: Optional[aiosqlite.Connection] = None
 
     async def setup_hook(self):
         self.db = await aiosqlite.connect(DB_PATH)
         self.db.row_factory = aiosqlite.Row
 
-        # Core tables
+        # Leagues are separated by format
         await db_exec(self.db, """
             CREATE TABLE IF NOT EXISTS leagues (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id TEXT,
                 name TEXT,
+                format TEXT,
                 status TEXT
             );
         """)
+
         await db_exec(self.db, """
             CREATE TABLE IF NOT EXISTS players (
                 league_id INTEGER,
@@ -70,18 +76,7 @@ class LeagueBot(commands.Bot):
                 PRIMARY KEY (league_id, user_id)
             );
         """)
-        await db_exec(self.db, """
-            CREATE TABLE IF NOT EXISTS matches (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                league_id INTEGER,
-                p1 TEXT,             -- gagnant si result='win' (sinon joueur A si draw)
-                p2 TEXT,             -- perdant si result='win' (sinon joueur B si draw)
-                result TEXT,         -- 'win' ou 'draw'
-                created_at INTEGER,
-                p1_deck TEXT,
-                p2_deck TEXT
-            );
-        """)
+
         await db_exec(self.db, """
             CREATE TABLE IF NOT EXISTS standings (
                 league_id INTEGER,
@@ -94,26 +89,43 @@ class LeagueBot(commands.Bot):
             );
         """)
 
-        # Deck directory (per guild)
+        # Matches belong to a league (=> format), but we store format too for easy export/debug
         await db_exec(self.db, """
-            CREATE TABLE IF NOT EXISTS decks (
-                guild_id TEXT,
-                name TEXT,
-                PRIMARY KEY (guild_id, name)
+            CREATE TABLE IF NOT EXISTS matches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                league_id INTEGER,
+                format TEXT,
+                p1 TEXT,            -- winner if win, else player A on draw
+                p2 TEXT,            -- loser if win, else player B on draw
+                result TEXT,        -- 'win' or 'draw'
+                created_at INTEGER,
+                p1_deck TEXT,
+                p2_deck TEXT
             );
         """)
 
-        # Pending matches (for confirmation flow)
+        # Deck directory separated by format
+        await db_exec(self.db, """
+            CREATE TABLE IF NOT EXISTS decks (
+                guild_id TEXT,
+                format TEXT,
+                name TEXT,
+                PRIMARY KEY (guild_id, format, name)
+            );
+        """)
+
+        # Pending matches for confirmation
         await db_exec(self.db, """
             CREATE TABLE IF NOT EXISTS pending_matches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 league_id INTEGER,
                 guild_id TEXT,
+                format TEXT,
                 reporter_id TEXT,
                 opponent_id TEXT,
-                result TEXT,         -- 'win' ou 'draw'
-                winner_id TEXT,      -- si result='win'
-                loser_id TEXT,       -- si result='win'
+                result TEXT,         -- 'win' or 'draw'
+                winner_id TEXT,      -- if win
+                loser_id TEXT,       -- if win
                 p1_deck TEXT,
                 p2_deck TEXT,
                 created_at INTEGER
@@ -131,13 +143,33 @@ class LeagueBot(commands.Bot):
 bot = LeagueBot()
 
 # =========================
+# Format helpers
+# =========================
+def normalize_format(fmt: str) -> str:
+    fmt = (fmt or "").strip()
+    # accept case-insensitive matches
+    for f in FORMATS:
+        if fmt.lower() == f.lower():
+            return f
+    return fmt
+
+async def format_autocomplete(interaction: discord.Interaction, current: str):
+    cur = (current or "").lower().strip()
+    return [
+        app_commands.Choice(name=f, value=f)
+        for f in FORMATS
+        if cur in f.lower()
+    ][:25]
+
+# =========================
 # League helpers
 # =========================
-async def get_open_league(guild_id: int):
+async def get_open_league(guild_id: int, fmt: str):
+    fmt = normalize_format(fmt)
     return await db_one(
         bot.db,
-        "SELECT * FROM leagues WHERE guild_id=? AND status='open' ORDER BY id DESC LIMIT 1",
-        (str(guild_id),),
+        "SELECT * FROM leagues WHERE guild_id=? AND format=? AND status='open' ORDER BY id DESC LIMIT 1",
+        (str(guild_id), fmt),
     )
 
 async def ensure_standing(league_id: int, user_id: str):
@@ -157,17 +189,25 @@ async def require_both_registered(interaction: discord.Interaction, league_id: i
     me_ok = await is_player(league_id, str(interaction.user.id))
     opp_ok = await is_player(league_id, str(opponent.id))
     if not me_ok:
-        await interaction.response.send_message("❌ Tu n'es pas inscrit à la ligue. Fais `/joinleague`.", ephemeral=True)
+        await interaction.response.send_message("❌ Tu n'es pas inscrit à ce tournoi. Fais `/joinleague`.", ephemeral=True)
         return False
     if not opp_ok:
-        await interaction.response.send_message("❌ Ton adversaire n'est pas inscrit à la ligue.", ephemeral=True)
+        await interaction.response.send_message("❌ Ton adversaire n'est pas inscrit à ce tournoi.", ephemeral=True)
         return False
     return True
 
-async def upsert_deck(guild_id: int, deck_name: str):
+# =========================
+# Deck helpers
+# =========================
+async def upsert_deck(guild_id: int, fmt: str, deck_name: str):
+    fmt = normalize_format(fmt)
     deck_name = deck_name.strip()
     if deck_name:
-        await db_exec(bot.db, "INSERT OR IGNORE INTO decks (guild_id, name) VALUES (?,?)", (str(guild_id), deck_name))
+        await db_exec(
+            bot.db,
+            "INSERT OR IGNORE INTO decks (guild_id, format, name) VALUES (?,?,?)",
+            (str(guild_id), fmt, deck_name),
+        )
 
 def validate_decks(*names: str) -> tuple[bool, str]:
     cleaned = [n.strip() for n in names]
@@ -177,16 +217,32 @@ def validate_decks(*names: str) -> tuple[bool, str]:
         return False, "❌ Nom de deck trop long (max 50 caractères)."
     return True, ""
 
-# =========================
-# Autocomplete decks
-# =========================
 async def deck_autocomplete(interaction: discord.Interaction, current: str):
-    current = (current or "").strip()
-    rows = await db_all(
-        bot.db,
-        "SELECT name FROM decks WHERE guild_id=? AND name LIKE ? ORDER BY name LIMIT 25",
-        (str(interaction.guild_id), f"%{current}%"),
-    )
+    """
+    On filtre par format sélectionné si possible : interaction.namespace.format
+    """
+    cur = (current or "").strip()
+    fmt = None
+    try:
+        fmt = getattr(interaction.namespace, "format", None)
+    except Exception:
+        fmt = None
+    fmt = normalize_format(fmt) if fmt else None
+
+    if fmt and fmt in FORMATS:
+        rows = await db_all(
+            bot.db,
+            "SELECT name FROM decks WHERE guild_id=? AND format=? AND name LIKE ? ORDER BY name LIMIT 25",
+            (str(interaction.guild_id), fmt, f"%{cur}%"),
+        )
+    else:
+        # fallback: sans format (propose global)
+        rows = await db_all(
+            bot.db,
+            "SELECT name FROM decks WHERE guild_id=? AND name LIKE ? ORDER BY name LIMIT 25",
+            (str(interaction.guild_id), f"%{cur}%"),
+        )
+
     return [app_commands.Choice(name=r["name"], value=r["name"]) for r in rows]
 
 # =========================
@@ -221,7 +277,7 @@ async def apply_draw(league_id: int, p1_id: str, p2_id: str):
 # =========================
 class ConfirmMatchView(discord.ui.View):
     def __init__(self, pending_id: int, opponent_id: int):
-        super().__init__(timeout=24 * 60 * 60)  # 24h
+        super().__init__(timeout=24 * 60 * 60)
         self.pending_id = pending_id
         self.opponent_id = opponent_id
 
@@ -238,29 +294,23 @@ class ConfirmMatchView(discord.ui.View):
             self.disable_all_items()
             return await interaction.response.edit_message(content="ℹ️ Ce match n’est plus en attente.", view=self)
 
-        # league still open?
         league = await db_one(bot.db, "SELECT * FROM leagues WHERE id=?", (p["league_id"],))
         if not league or league["status"] != "open":
             await db_exec(bot.db, "DELETE FROM pending_matches WHERE id=?", (self.pending_id,))
             self.disable_all_items()
-            return await interaction.response.edit_message(content="❌ Ligue fermée : confirmation impossible.", view=self)
+            return await interaction.response.edit_message(content="❌ Tournoi fermé : confirmation impossible.", view=self)
 
-        # Still registered?
         reporter_id = int(p["reporter_id"])
         opponent_id = int(p["opponent_id"])
         if not await is_player(p["league_id"], str(reporter_id)) or not await is_player(p["league_id"], str(opponent_id)):
             await db_exec(bot.db, "DELETE FROM pending_matches WHERE id=?", (self.pending_id,))
             self.disable_all_items()
-            return await interaction.response.edit_message(
-                content="❌ Un des joueurs n’est plus inscrit : match annulé.",
-                view=self
-            )
+            return await interaction.response.edit_message(content="❌ Un joueur n’est plus inscrit : match annulé.", view=self)
 
-        # Auto-add decks to directory
-        await upsert_deck(int(p["guild_id"]), p["p1_deck"] or "")
-        await upsert_deck(int(p["guild_id"]), p["p2_deck"] or "")
+        fmt = normalize_format(p["format"])
+        await upsert_deck(int(p["guild_id"]), fmt, p["p1_deck"] or "")
+        await upsert_deck(int(p["guild_id"]), fmt, p["p2_deck"] or "")
 
-        # Apply result + write match
         if p["result"] == "win":
             winner_id = str(p["winner_id"])
             loser_id = str(p["loser_id"])
@@ -268,15 +318,15 @@ class ConfirmMatchView(discord.ui.View):
 
             await db_exec(
                 bot.db,
-                "INSERT INTO matches (league_id, p1, p2, result, created_at, p1_deck, p2_deck) VALUES (?,?,?,?,?,?,?)",
-                (p["league_id"], winner_id, loser_id, "win", p["created_at"], p["p1_deck"], p["p2_deck"]),
+                "INSERT INTO matches (league_id, format, p1, p2, result, created_at, p1_deck, p2_deck) VALUES (?,?,?,?,?,?,?,?)",
+                (p["league_id"], fmt, winner_id, loser_id, "win", p["created_at"], p["p1_deck"], p["p2_deck"]),
             )
         else:
             await apply_draw(p["league_id"], str(p["reporter_id"]), str(p["opponent_id"]))
             await db_exec(
                 bot.db,
-                "INSERT INTO matches (league_id, p1, p2, result, created_at, p1_deck, p2_deck) VALUES (?,?,?,?,?,?,?)",
-                (p["league_id"], str(p["reporter_id"]), str(p["opponent_id"]), "draw", p["created_at"], p["p1_deck"], p["p2_deck"]),
+                "INSERT INTO matches (league_id, format, p1, p2, result, created_at, p1_deck, p2_deck) VALUES (?,?,?,?,?,?,?,?)",
+                (p["league_id"], fmt, str(p["reporter_id"]), str(p["opponent_id"]), "draw", p["created_at"], p["p1_deck"], p["p2_deck"]),
             )
 
         await db_exec(bot.db, "DELETE FROM pending_matches WHERE id=?", (self.pending_id,))
@@ -290,48 +340,79 @@ class ConfirmMatchView(discord.ui.View):
         await interaction.response.edit_message(content="❌ Match refusé.", view=self)
 
 # =========================
-# Slash commands: League
+# Autocomplete for reportmatch
 # =========================
-@bot.tree.command(name="league_create", description="Créer et ouvrir une ligue (admin)")
+async def _auto_resultat(interaction: discord.Interaction, current: str):
+    choices = ["win", "draw"]
+    cur = (current or "").lower()
+    return [app_commands.Choice(name=c, value=c) for c in choices if cur in c][:25]
+
+async def _auto_victoire_de(interaction: discord.Interaction, current: str):
+    choices = ["moi", "adversaire"]
+    cur = (current or "").lower()
+    return [app_commands.Choice(name=c, value=c) for c in choices if cur in c][:25]
+
+# =========================
+# Commands: League management
+# =========================
+@bot.tree.command(name="league_create", description="Créer et ouvrir un tournoi (admin)")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def league_create(interaction: discord.Interaction, name: str):
+@app_commands.autocomplete(format=format_autocomplete)
+async def league_create(interaction: discord.Interaction, name: str, format: str):
+    fmt = normalize_format(format)
+    if fmt not in FORMATS:
+        return await interaction.response.send_message("❌ Format invalide (Genesys / Compétitif / Chill).", ephemeral=True)
+
+    # Option: only one open league per format, close previous automatically
+    prev = await get_open_league(interaction.guild_id, fmt)
+    if prev:
+        await db_exec(bot.db, "UPDATE leagues SET status='closed' WHERE id=?", (prev["id"],))
+
     await db_exec(
         bot.db,
-        "INSERT INTO leagues (guild_id, name, status) VALUES (?,?,?)",
-        (str(interaction.guild_id), name, "open"),
+        "INSERT INTO leagues (guild_id, name, format, status) VALUES (?,?,?,?)",
+        (str(interaction.guild_id), name, fmt, "open"),
     )
-    await interaction.response.send_message(f"✅ Ligue **{name}** créée et ouverte")
+    await interaction.response.send_message(f"✅ Tournoi **{name}** ouvert — format **{fmt}**")
 
-@bot.tree.command(name="league_close", description="Fermer la ligue en cours (admin)")
+@bot.tree.command(name="league_close", description="Fermer le tournoi d'un format (admin)")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def league_close(interaction: discord.Interaction):
-    league = await get_open_league(interaction.guild_id)
+@app_commands.autocomplete(format=format_autocomplete)
+async def league_close(interaction: discord.Interaction, format: str):
+    fmt = normalize_format(format)
+    league = await get_open_league(interaction.guild_id, fmt)
     if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
 
     await db_exec(bot.db, "UPDATE leagues SET status='closed' WHERE id=?", (league["id"],))
-    await interaction.response.send_message(f"🔒 Ligue **{league['name']}** fermée")
+    await interaction.response.send_message(f"🔒 Tournoi **{league['name']}** fermé — format **{fmt}**")
 
-@bot.tree.command(name="league_status", description="Infos sur la ligue ouverte")
-async def league_status(interaction: discord.Interaction):
-    league = await get_open_league(interaction.guild_id)
+@bot.tree.command(name="league_status", description="Infos du tournoi (par format)")
+@app_commands.autocomplete(format=format_autocomplete)
+async def league_status(interaction: discord.Interaction, format: str):
+    fmt = normalize_format(format)
+    league = await get_open_league(interaction.guild_id, fmt)
     if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
 
     players_count = await db_one(bot.db, "SELECT COUNT(*) AS c FROM players WHERE league_id=?", (league["id"],))
     matches_count = await db_one(bot.db, "SELECT COUNT(*) AS c FROM matches WHERE league_id=?", (league["id"],))
+    decks_count = await db_one(
+        bot.db, "SELECT COUNT(*) AS c FROM decks WHERE guild_id=? AND format=?",
+        (str(interaction.guild_id), fmt),
+    )
     last_match = await db_one(
         bot.db,
         "SELECT created_at, result, p1, p2, p1_deck, p2_deck FROM matches WHERE league_id=? ORDER BY id DESC LIMIT 1",
         (league["id"],),
     )
-    decks_count = await db_one(bot.db, "SELECT COUNT(*) AS c FROM decks WHERE guild_id=?", (str(interaction.guild_id),))
 
     msg = [
-        f"🏁 **Ligue ouverte** : **{league['name']}**",
+        f"🏁 **Tournoi ouvert** : **{league['name']}**",
+        f"🎮 Format: **{fmt}**",
         f"👥 Inscrits: **{players_count['c']}**",
         f"🧾 Matchs: **{matches_count['c']}**",
-        f"📁 Decks dans le répertoire: **{decks_count['c']}**",
+        f"📁 Decks (répertoire): **{decks_count['c']}**",
     ]
     if last_match:
         t = f"<t:{last_match['created_at']}:R>" if last_match["created_at"] else ""
@@ -342,180 +423,97 @@ async def league_status(interaction: discord.Interaction):
 
     await interaction.response.send_message("\n".join(msg))
 
-@bot.tree.command(name="joinleague", description="S'inscrire à la ligue")
-async def joinleague(interaction: discord.Interaction):
-    league = await get_open_league(interaction.guild_id)
+@bot.tree.command(name="joinleague", description="S'inscrire au tournoi (par format)")
+@app_commands.autocomplete(format=format_autocomplete)
+async def joinleague(interaction: discord.Interaction, format: str):
+    fmt = normalize_format(format)
+    league = await get_open_league(interaction.guild_id, fmt)
     if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
 
     await db_exec(
         bot.db,
         "INSERT OR IGNORE INTO players (league_id, user_id) VALUES (?,?)",
         (league["id"], str(interaction.user.id)),
     )
-    await interaction.response.send_message("✅ Inscription validée")
+    await interaction.response.send_message(f"✅ Inscription validée — format **{fmt}**")
 
-@bot.tree.command(name="leaveleague", description="Quitter la ligue (on garde tes stats)")
-async def leaveleague(interaction: discord.Interaction):
-    league = await get_open_league(interaction.guild_id)
+@bot.tree.command(name="leaveleague", description="Quitter le tournoi (stats conservées)")
+@app_commands.autocomplete(format=format_autocomplete)
+async def leaveleague(interaction: discord.Interaction, format: str):
+    fmt = normalize_format(format)
+    league = await get_open_league(interaction.guild_id, fmt)
     if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
 
     await db_exec(
         bot.db,
         "DELETE FROM players WHERE league_id=? AND user_id=?",
         (league["id"], str(interaction.user.id)),
     )
-    await interaction.response.send_message("🚪 Tu as quitté la ligue. Tes stats sont conservées.")
-
-@bot.tree.command(name="league_leaderboard", description="Afficher le classement")
-async def league_leaderboard(interaction: discord.Interaction):
-    league = await get_open_league(interaction.guild_id)
-    if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
-
-    rows = await db_all(
-        bot.db,
-        "SELECT * FROM standings WHERE league_id=? ORDER BY points DESC, wins DESC, draws DESC LIMIT 50",
-        (league["id"],),
-    )
-    if not rows:
-        return await interaction.response.send_message("ℹ️ Aucun match enregistré")
-
-    text = "\n".join(
-        f"{i+1}. <@{r['user_id']}> — {r['points']} pts ({r['wins']}/{r['draws']}/{r['losses']})"
-        for i, r in enumerate(rows)
-    )
-    await interaction.response.send_message(f"📊 **Classement**\n{text}")
-
-@bot.tree.command(name="league_history", description="Afficher les derniers matchs (avec decks)")
-async def league_history(interaction: discord.Interaction, nombre: app_commands.Range[int, 1, 25] = 10):
-    league = await get_open_league(interaction.guild_id)
-    if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
-
-    rows = await db_all(
-        bot.db,
-        """
-        SELECT id, p1, p2, result, created_at, p1_deck, p2_deck
-        FROM matches
-        WHERE league_id=?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (league["id"], int(nombre)),
-    )
-    if not rows:
-        return await interaction.response.send_message("ℹ️ Aucun match enregistré")
-
-    lines = []
-    for m in rows:
-        outcome = "🏆 Victoire" if m["result"] == "win" else "🤝 Égalité"
-        t = f"<t:{m['created_at']}:R>" if m["created_at"] else ""
-        p1 = f"<@{m['p1']}>"
-        p2 = f"<@{m['p2']}>"
-        d1 = m["p1_deck"] or "?"
-        d2 = m["p2_deck"] or "?"
-        lines.append(f"• #{m['id']} — {outcome} — {t}\n  {p1} (**{d1}**) vs {p2} (**{d2}**)")
-
-    await interaction.response.send_message("🧾 **Derniers matchs**\n" + "\n".join(lines))
-
-@bot.tree.command(name="league_undo_last", description="Annuler le dernier match enregistré (admin)")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def league_undo_last(interaction: discord.Interaction):
-    league = await get_open_league(interaction.guild_id)
-    if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
-
-    m = await db_one(
-        bot.db,
-        "SELECT * FROM matches WHERE league_id=? ORDER BY id DESC LIMIT 1",
-        (league["id"],),
-    )
-    if not m:
-        return await interaction.response.send_message("ℹ️ Aucun match à annuler", ephemeral=True)
-
-    if m["result"] == "win":
-        await db_exec(
-            bot.db,
-            "UPDATE standings SET wins=wins-1, points=points-3 WHERE league_id=? AND user_id=?",
-            (league["id"], m["p1"]),
-        )
-        await db_exec(
-            bot.db,
-            "UPDATE standings SET losses=losses-1 WHERE league_id=? AND user_id=?",
-            (league["id"], m["p2"]),
-        )
-    elif m["result"] == "draw":
-        for uid in (m["p1"], m["p2"]):
-            await db_exec(
-                bot.db,
-                "UPDATE standings SET draws=draws-1, points=points-1 WHERE league_id=? AND user_id=?",
-                (league["id"], uid),
-            )
-
-    await db_exec(bot.db, "DELETE FROM matches WHERE id=?", (m["id"],))
-    await interaction.response.send_message("↩️ Dernier match annulé.")
-
-@bot.tree.command(name="admin_reset_league", description="Reset standings + matchs + inscrits (admin)")
-@app_commands.checks.has_permissions(manage_guild=True)
-async def admin_reset_league(interaction: discord.Interaction):
-    league = await get_open_league(interaction.guild_id)
-    if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
-
-    await db_exec(bot.db, "DELETE FROM matches WHERE league_id=?", (league["id"],))
-    await db_exec(bot.db, "DELETE FROM standings WHERE league_id=?", (league["id"],))
-    await db_exec(bot.db, "DELETE FROM players WHERE league_id=?", (league["id"],))
-    await db_exec(bot.db, "DELETE FROM pending_matches WHERE league_id=?", (league["id"],))
-
-    await interaction.response.send_message(
-        "🧹 Reset effectué : matchs, standings et inscrits supprimés pour la ligue ouverte. (Répertoire decks conservé)"
-    )
+    await interaction.response.send_message(f"🚪 Tu as quitté le tournoi **{fmt}**. Tes stats restent en base.")
 
 # =========================
-# Slash commands: Deck directory
+# Commands: Deck directory (per format)
 # =========================
-@bot.tree.command(name="deck_add", description="Ajouter un deck au répertoire (admin)")
+@bot.tree.command(name="deck_add", description="Ajouter un deck au répertoire (admin, par format)")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def deck_add(interaction: discord.Interaction, name: str):
+@app_commands.autocomplete(format=format_autocomplete)
+async def deck_add(interaction: discord.Interaction, format: str, name: str):
+    fmt = normalize_format(format)
+    if fmt not in FORMATS:
+        return await interaction.response.send_message("❌ Format invalide.", ephemeral=True)
+
     name = name.strip()
     if not name:
-        return await interaction.response.send_message("❌ Nom invalide", ephemeral=True)
+        return await interaction.response.send_message("❌ Nom invalide.", ephemeral=True)
     if len(name) > 50:
         return await interaction.response.send_message("❌ Nom trop long (max 50 caractères).", ephemeral=True)
 
-    await upsert_deck(interaction.guild_id, name)
-    await interaction.response.send_message(f"✅ Deck ajouté: **{name}**")
+    await upsert_deck(interaction.guild_id, fmt, name)
+    await interaction.response.send_message(f"✅ Deck ajouté au répertoire **{fmt}** : **{name}**")
 
-@bot.tree.command(name="deck_remove", description="Supprimer un deck du répertoire (admin)")
+@bot.tree.command(name="deck_remove", description="Supprimer un deck (admin, par format)")
 @app_commands.checks.has_permissions(manage_guild=True)
-@app_commands.autocomplete(name=deck_autocomplete)
-async def deck_remove(interaction: discord.Interaction, name: str):
+@app_commands.autocomplete(format=format_autocomplete, name=deck_autocomplete)
+async def deck_remove(interaction: discord.Interaction, format: str, name: str):
+    fmt = normalize_format(format)
+    if fmt not in FORMATS:
+        return await interaction.response.send_message("❌ Format invalide.", ephemeral=True)
+
     name = name.strip()
     if not name:
-        return await interaction.response.send_message("❌ Nom invalide", ephemeral=True)
+        return await interaction.response.send_message("❌ Nom invalide.", ephemeral=True)
 
-    await db_exec(bot.db, "DELETE FROM decks WHERE guild_id=? AND name=?", (str(interaction.guild_id), name))
-    await interaction.response.send_message(f"🗑️ Deck supprimé: **{name}**")
+    await db_exec(
+        bot.db,
+        "DELETE FROM decks WHERE guild_id=? AND format=? AND name=?",
+        (str(interaction.guild_id), fmt, name),
+    )
+    await interaction.response.send_message(f"🗑️ Deck supprimé du répertoire **{fmt}** : **{name}**")
 
-@bot.tree.command(name="deck_list", description="Afficher le répertoire des decks")
-async def deck_list(interaction: discord.Interaction):
+@bot.tree.command(name="deck_list", description="Afficher le répertoire des decks (par format)")
+@app_commands.autocomplete(format=format_autocomplete)
+async def deck_list(interaction: discord.Interaction, format: str):
+    fmt = normalize_format(format)
+    if fmt not in FORMATS:
+        return await interaction.response.send_message("❌ Format invalide.", ephemeral=True)
+
     rows = await db_all(
         bot.db,
-        "SELECT name FROM decks WHERE guild_id=? ORDER BY name",
-        (str(interaction.guild_id),),
+        "SELECT name FROM decks WHERE guild_id=? AND format=? ORDER BY name",
+        (str(interaction.guild_id), fmt),
     )
     if not rows:
-        return await interaction.response.send_message("ℹ️ Aucun deck dans le répertoire pour l’instant.")
+        return await interaction.response.send_message(f"ℹ️ Aucun deck dans le répertoire **{fmt}** pour l’instant.")
 
     names = [r["name"] for r in rows]
     text = "\n".join(f"• {n}" for n in names)
 
     if len(text) <= 1800:
-        return await interaction.response.send_message(f"📁 **Répertoire des decks**\n{text}")
+        return await interaction.response.send_message(f"📁 **Répertoire des decks — {fmt}**\n{text}")
 
-    await interaction.response.send_message("📁 **Répertoire des decks** (suite en messages)")
+    await interaction.response.send_message(f"📁 **Répertoire des decks — {fmt}** (suite en messages)")
     chunk = ""
     for n in names:
         line = f"• {n}\n"
@@ -527,22 +525,26 @@ async def deck_list(interaction: discord.Interaction):
         await interaction.followup.send(chunk)
 
 # =========================
-# Slash commands: Matches (direct)
+# Commands: Matches (direct) - per format
 # =========================
-@bot.tree.command(name="winversus", description="Déclarer une victoire (decks obligatoires)")
-@app_commands.autocomplete(deck_gagnant=deck_autocomplete, deck_adverse=deck_autocomplete)
+@bot.tree.command(name="winversus", description="Déclarer une victoire (par format, decks obligatoires)")
+@app_commands.autocomplete(format=format_autocomplete, deck_gagnant=deck_autocomplete, deck_adverse=deck_autocomplete)
 async def winversus(
     interaction: discord.Interaction,
+    format: str,
     adversaire: discord.User,
     deck_gagnant: str,
     deck_adverse: str,
 ):
+    fmt = normalize_format(format)
+    if fmt not in FORMATS:
+        return await interaction.response.send_message("❌ Format invalide.", ephemeral=True)
     if adversaire.id == interaction.user.id:
-        return await interaction.response.send_message("❌ Impossible contre toi-même", ephemeral=True)
+        return await interaction.response.send_message("❌ Impossible contre toi-même.", ephemeral=True)
 
-    league = await get_open_league(interaction.guild_id)
+    league = await get_open_league(interaction.guild_id, fmt)
     if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
 
     ok = await require_both_registered(interaction, league["id"], adversaire)
     if not ok:
@@ -555,8 +557,9 @@ async def winversus(
     deck_gagnant = deck_gagnant.strip()
     deck_adverse = deck_adverse.strip()
 
-    await upsert_deck(interaction.guild_id, deck_gagnant)
-    await upsert_deck(interaction.guild_id, deck_adverse)
+    # auto-add to deck directory for this format
+    await upsert_deck(interaction.guild_id, fmt, deck_gagnant)
+    await upsert_deck(interaction.guild_id, fmt, deck_adverse)
 
     winner_id = str(interaction.user.id)
     loser_id = str(adversaire.id)
@@ -565,29 +568,33 @@ async def winversus(
 
     await db_exec(
         bot.db,
-        "INSERT INTO matches (league_id, p1, p2, result, created_at, p1_deck, p2_deck) VALUES (?,?,?,?,?,?,?)",
-        (league["id"], winner_id, loser_id, "win", now(), deck_gagnant, deck_adverse),
+        "INSERT INTO matches (league_id, format, p1, p2, result, created_at, p1_deck, p2_deck) VALUES (?,?,?,?,?,?,?,?)",
+        (league["id"], fmt, winner_id, loser_id, "win", now(), deck_gagnant, deck_adverse),
     )
 
     await interaction.response.send_message(
-        f"🏆 <@{interaction.user.id}> gagne contre <@{adversaire.id}> (+3 pts)\n"
+        f"🏆 **{fmt}** — <@{interaction.user.id}> gagne contre <@{adversaire.id}> (+3 pts)\n"
         f"🃏 Decks: **{deck_gagnant}** vs **{deck_adverse}**"
     )
 
-@bot.tree.command(name="drawversus", description="Déclarer une égalité (decks obligatoires)")
-@app_commands.autocomplete(deck_p1=deck_autocomplete, deck_p2=deck_autocomplete)
+@bot.tree.command(name="drawversus", description="Déclarer une égalité (par format, decks obligatoires)")
+@app_commands.autocomplete(format=format_autocomplete, deck_p1=deck_autocomplete, deck_p2=deck_autocomplete)
 async def drawversus(
     interaction: discord.Interaction,
+    format: str,
     adversaire: discord.User,
     deck_p1: str,
     deck_p2: str,
 ):
+    fmt = normalize_format(format)
+    if fmt not in FORMATS:
+        return await interaction.response.send_message("❌ Format invalide.", ephemeral=True)
     if adversaire.id == interaction.user.id:
-        return await interaction.response.send_message("❌ Impossible contre toi-même", ephemeral=True)
+        return await interaction.response.send_message("❌ Impossible contre toi-même.", ephemeral=True)
 
-    league = await get_open_league(interaction.guild_id)
+    league = await get_open_league(interaction.guild_id, fmt)
     if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
 
     ok = await require_both_registered(interaction, league["id"], adversaire)
     if not ok:
@@ -600,8 +607,8 @@ async def drawversus(
     deck_p1 = deck_p1.strip()
     deck_p2 = deck_p2.strip()
 
-    await upsert_deck(interaction.guild_id, deck_p1)
-    await upsert_deck(interaction.guild_id, deck_p2)
+    await upsert_deck(interaction.guild_id, fmt, deck_p1)
+    await upsert_deck(interaction.guild_id, fmt, deck_p2)
 
     p1_id = str(interaction.user.id)
     p2_id = str(adversaire.id)
@@ -610,50 +617,44 @@ async def drawversus(
 
     await db_exec(
         bot.db,
-        "INSERT INTO matches (league_id, p1, p2, result, created_at, p1_deck, p2_deck) VALUES (?,?,?,?,?,?,?)",
-        (league["id"], p1_id, p2_id, "draw", now(), deck_p1, deck_p2),
+        "INSERT INTO matches (league_id, format, p1, p2, result, created_at, p1_deck, p2_deck) VALUES (?,?,?,?,?,?,?,?)",
+        (league["id"], fmt, p1_id, p2_id, "draw", now(), deck_p1, deck_p2),
     )
 
     await interaction.response.send_message(
-        f"🤝 Égalité entre <@{interaction.user.id}> et <@{adversaire.id}> (+1 pt chacun)\n"
+        f"🤝 **{fmt}** — Égalité entre <@{interaction.user.id}> et <@{adversaire.id}> (+1 pt chacun)\n"
         f"🃏 Decks: **{deck_p1}** vs **{deck_p2}**"
     )
 
 # =========================
-# Slash commands: Confirmation flow (optional) - FIXED
+# Commands: Confirmation flow (optional) - per format
 # =========================
-async def _auto_resultat(interaction: discord.Interaction, current: str):
-    # returning Choice is OK here because the PARAMETER is str, not Choice[]
-    choices = ["win", "draw"]
-    cur = (current or "").lower()
-    return [app_commands.Choice(name=c, value=c) for c in choices if cur in c][:25]
-
-async def _auto_victoire_de(interaction: discord.Interaction, current: str):
-    choices = ["moi", "adversaire"]
-    cur = (current or "").lower()
-    return [app_commands.Choice(name=c, value=c) for c in choices if cur in c][:25]
-
-@bot.tree.command(name="reportmatch", description="Déclarer un match à confirmer (win/draw)")
+@bot.tree.command(name="reportmatch", description="Déclarer un match à confirmer (par format)")
 @app_commands.autocomplete(
+    format=format_autocomplete,
     deck_moi=deck_autocomplete,
     deck_adverse=deck_autocomplete,
     resultat=_auto_resultat,
-    victoire_de=_auto_victoire_de
+    victoire_de=_auto_victoire_de,
 )
 async def reportmatch(
     interaction: discord.Interaction,
+    format: str,
     adversaire: discord.User,
-    resultat: str,           # 'win' ou 'draw'
+    resultat: str,          # 'win' or 'draw'
     deck_moi: str,
     deck_adverse: str,
-    victoire_de: str = "moi" # 'moi' ou 'adversaire' (utilisé seulement si resultat='win')
+    victoire_de: str = "moi"  # 'moi'/'adversaire' if win
 ):
+    fmt = normalize_format(format)
+    if fmt not in FORMATS:
+        return await interaction.response.send_message("❌ Format invalide.", ephemeral=True)
     if adversaire.id == interaction.user.id:
-        return await interaction.response.send_message("❌ Impossible contre toi-même", ephemeral=True)
+        return await interaction.response.send_message("❌ Impossible contre toi-même.", ephemeral=True)
 
-    league = await get_open_league(interaction.guild_id)
+    league = await get_open_league(interaction.guild_id, fmt)
     if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
 
     ok = await require_both_registered(interaction, league["id"], adversaire)
     if not ok:
@@ -701,12 +702,13 @@ async def reportmatch(
         bot.db,
         """
         INSERT INTO pending_matches
-        (league_id, guild_id, reporter_id, opponent_id, result, winner_id, loser_id, p1_deck, p2_deck, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+        (league_id, guild_id, format, reporter_id, opponent_id, result, winner_id, loser_id, p1_deck, p2_deck, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             league["id"],
             str(interaction.guild_id),
+            fmt,
             str(reporter_id),
             str(opponent_id),
             resultat,
@@ -725,30 +727,147 @@ async def reportmatch(
 
     if resultat == "win":
         msg = (
-            f"📨 <@{reporter_id}> a reporté un match.\n"
+            f"📨 **{fmt}** — <@{reporter_id}> a reporté un match.\n"
             f"Résultat: 🏆 **Victoire de <@{winner_id}>**\n"
             f"Decks: **{p1_deck}** vs **{p2_deck}**\n\n"
             f"<@{opponent_id}>, confirme ou refuse :"
         )
     else:
         msg = (
-            f"📨 <@{reporter_id}> a reporté un match.\n"
+            f"📨 **{fmt}** — <@{reporter_id}> a reporté un match.\n"
             f"Résultat: 🤝 **Égalité**\n"
             f"Decks: **{p1_deck}** vs **{p2_deck}**\n\n"
             f"<@{opponent_id}>, confirme ou refuse :"
         )
 
-    await interaction.response.send_message("✅ Demande envoyée à l’adversaire pour confirmation.")
+    await interaction.response.send_message(f"✅ Demande envoyée pour confirmation — format **{fmt}**.")
     await interaction.followup.send(msg, view=view)
 
 # =========================
-# Slash commands: Stats (players)
+# Commands: Leaderboard / History / Stats (per format)
 # =========================
-@bot.tree.command(name="my_stats", description="Afficher tes stats + tes decks les plus joués")
-async def my_stats(interaction: discord.Interaction):
-    league = await get_open_league(interaction.guild_id)
+@bot.tree.command(name="league_leaderboard", description="Classement (par format)")
+@app_commands.autocomplete(format=format_autocomplete)
+async def league_leaderboard(interaction: discord.Interaction, format: str):
+    fmt = normalize_format(format)
+    league = await get_open_league(interaction.guild_id, fmt)
     if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
+
+    rows = await db_all(
+        bot.db,
+        "SELECT * FROM standings WHERE league_id=? ORDER BY points DESC, wins DESC, draws DESC LIMIT 50",
+        (league["id"],),
+    )
+    if not rows:
+        return await interaction.response.send_message("ℹ️ Aucun match enregistré.")
+
+    text = "\n".join(
+        f"{i+1}. <@{r['user_id']}> — {r['points']} pts ({r['wins']}/{r['draws']}/{r['losses']})"
+        for i, r in enumerate(rows)
+    )
+    await interaction.response.send_message(f"📊 **Classement — {fmt}**\n{text}")
+
+@bot.tree.command(name="league_history", description="Derniers matchs (par format)")
+@app_commands.autocomplete(format=format_autocomplete)
+async def league_history(interaction: discord.Interaction, format: str, nombre: app_commands.Range[int, 1, 25] = 10):
+    fmt = normalize_format(format)
+    league = await get_open_league(interaction.guild_id, fmt)
+    if not league:
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
+
+    rows = await db_all(
+        bot.db,
+        """
+        SELECT id, p1, p2, result, created_at, p1_deck, p2_deck
+        FROM matches
+        WHERE league_id=?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (league["id"], int(nombre)),
+    )
+    if not rows:
+        return await interaction.response.send_message("ℹ️ Aucun match enregistré.")
+
+    lines = []
+    for m in rows:
+        outcome = "🏆 Victoire" if m["result"] == "win" else "🤝 Égalité"
+        t = f"<t:{m['created_at']}:R>" if m["created_at"] else ""
+        lines.append(
+            f"• #{m['id']} — {outcome} — {t}\n"
+            f"  <@{m['p1']}> (**{m['p1_deck'] or '?'}**) vs <@{m['p2']}> (**{m['p2_deck'] or '?'}**)"
+        )
+
+    await interaction.response.send_message(f"🧾 **Derniers matchs — {fmt}**\n" + "\n".join(lines))
+
+@bot.tree.command(name="league_undo_last", description="Annuler le dernier match (admin, par format)")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.autocomplete(format=format_autocomplete)
+async def league_undo_last(interaction: discord.Interaction, format: str):
+    fmt = normalize_format(format)
+    league = await get_open_league(interaction.guild_id, fmt)
+    if not league:
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
+
+    m = await db_one(
+        bot.db,
+        "SELECT * FROM matches WHERE league_id=? ORDER BY id DESC LIMIT 1",
+        (league["id"],),
+    )
+    if not m:
+        return await interaction.response.send_message("ℹ️ Aucun match à annuler.", ephemeral=True)
+
+    if m["result"] == "win":
+        await db_exec(
+            bot.db,
+            "UPDATE standings SET wins=wins-1, points=points-3 WHERE league_id=? AND user_id=?",
+            (league["id"], m["p1"]),
+        )
+        await db_exec(
+            bot.db,
+            "UPDATE standings SET losses=losses-1 WHERE league_id=? AND user_id=?",
+            (league["id"], m["p2"]),
+        )
+    else:
+        for uid in (m["p1"], m["p2"]):
+            await db_exec(
+                bot.db,
+                "UPDATE standings SET draws=draws-1, points=points-1 WHERE league_id=? AND user_id=?",
+                (league["id"], uid),
+            )
+
+    await db_exec(bot.db, "DELETE FROM matches WHERE id=?", (m["id"],))
+    await interaction.response.send_message(f"↩️ Dernier match annulé — **{fmt}**")
+
+@bot.tree.command(name="admin_reset_league", description="Reset tournoi (admin, par format)")
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.autocomplete(format=format_autocomplete)
+async def admin_reset_league(interaction: discord.Interaction, format: str):
+    fmt = normalize_format(format)
+    league = await get_open_league(interaction.guild_id, fmt)
+    if not league:
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
+
+    await db_exec(bot.db, "DELETE FROM matches WHERE league_id=?", (league["id"],))
+    await db_exec(bot.db, "DELETE FROM standings WHERE league_id=?", (league["id"],))
+    await db_exec(bot.db, "DELETE FROM players WHERE league_id=?", (league["id"],))
+    await db_exec(bot.db, "DELETE FROM pending_matches WHERE league_id=?", (league["id"],))
+
+    await interaction.response.send_message(
+        f"🧹 Reset effectué — **{fmt}** : matchs, standings, inscrits supprimés. (Decks du répertoire conservés)"
+    )
+
+# =========================
+# Stats: my_stats / h2h (per format)
+# =========================
+@bot.tree.command(name="my_stats", description="Tes stats (par format)")
+@app_commands.autocomplete(format=format_autocomplete)
+async def my_stats(interaction: discord.Interaction, format: str):
+    fmt = normalize_format(format)
+    league = await get_open_league(interaction.guild_id, fmt)
+    if not league:
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
 
     uid = str(interaction.user.id)
     row = await db_one(bot.db, "SELECT * FROM standings WHERE league_id=? AND user_id=?", (league["id"], uid))
@@ -773,28 +892,28 @@ async def my_stats(interaction: discord.Interaction):
         """,
         (league["id"], uid, league["id"], uid),
     )
-
     top_decks = "\n".join([f"• **{r['deck']}** — {r['games']} match(s)" for r in decks_rows]) if decks_rows else "• (aucun deck enregistré)"
 
     await interaction.response.send_message(
-        "👤 **Tes stats**\n"
+        f"👤 **Tes stats — {fmt}**\n"
         f"• Points: **{row['points']}**\n"
         f"• Bilan: **{row['wins']}**W / **{row['draws']}**D / **{row['losses']}**L (Total: {total})\n"
         f"• Winrate: **{winrate:.1f}%**\n\n"
-        "🃏 **Tes decks les plus joués**\n"
-        f"{top_decks}"
+        f"🃏 **Tes decks les plus joués — {fmt}**\n{top_decks}"
     )
 
-@bot.tree.command(name="h2h", description="Stats face-à-face contre un joueur")
-async def h2h(interaction: discord.Interaction, adversaire: discord.User):
+@bot.tree.command(name="h2h", description="Face-à-face contre un joueur (par format)")
+@app_commands.autocomplete(format=format_autocomplete)
+async def h2h(interaction: discord.Interaction, format: str, adversaire: discord.User):
+    fmt = normalize_format(format)
     if adversaire.bot:
         return await interaction.response.send_message("❌ Pas de H2H contre un bot.", ephemeral=True)
     if adversaire.id == interaction.user.id:
         return await interaction.response.send_message("❌ Pas de H2H contre toi-même.", ephemeral=True)
 
-    league = await get_open_league(interaction.guild_id)
+    league = await get_open_league(interaction.guild_id, fmt)
     if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
 
     me = str(interaction.user.id)
     opp = str(adversaire.id)
@@ -827,25 +946,30 @@ async def h2h(interaction: discord.Interaction, adversaire: discord.User):
     for m in last:
         t = f"<t:{m['created_at']}:R>" if m["created_at"] else ""
         if m["result"] == "draw":
-            last_lines.append(f"• 🤝 {t} — <@{m['p1']}> (**{m['p1_deck'] or '?'}**) vs <@{m['p2']}> (**{m['p2_deck'] or '?'}**)")
+            last_lines.append(
+                f"• 🤝 {t} — <@{m['p1']}> (**{m['p1_deck'] or '?'}**) vs <@{m['p2']}> (**{m['p2_deck'] or '?'}**)"
+            )
         else:
-            last_lines.append(f"• 🏆 {t} — gagnant: <@{m['p1']}> — decks: **{m['p1_deck'] or '?'}** vs **{m['p2_deck'] or '?'}**")
+            last_lines.append(
+                f"• 🏆 {t} — gagnant: <@{m['p1']}> — decks: **{m['p1_deck'] or '?'}** vs **{m['p2_deck'] or '?'}**"
+            )
 
     await interaction.response.send_message(
-        f"🤜🤛 **H2H** <@{interaction.user.id}> vs <@{adversaire.id}>\n"
+        f"🤜🤛 **H2H — {fmt}** <@{interaction.user.id}> vs <@{adversaire.id}>\n"
         f"• Bilan: **{w}W / {d}D / {l}L** (Total: {len(rows)})\n\n"
         "🕘 **Derniers matchs**\n" + "\n".join(last_lines)
     )
 
 # =========================
-# Slash commands: Deck stats
+# Deck stats / matchups (per format)
 # =========================
-@bot.tree.command(name="deck_stats", description="Stats d'un deck (matchs, winrate, matchups)")
-@app_commands.autocomplete(deck=deck_autocomplete)
-async def deck_stats(interaction: discord.Interaction, deck: str):
-    league = await get_open_league(interaction.guild_id)
+@bot.tree.command(name="deck_stats", description="Stats d'un deck (par format)")
+@app_commands.autocomplete(format=format_autocomplete, deck=deck_autocomplete)
+async def deck_stats(interaction: discord.Interaction, format: str, deck: str):
+    fmt = normalize_format(format)
+    league = await get_open_league(interaction.guild_id, fmt)
     if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
 
     deck = deck.strip()
     if not deck:
@@ -868,12 +992,12 @@ async def deck_stats(interaction: discord.Interaction, deck: str):
 
     games = int(stats["games"] or 0)
     if games == 0:
-        return await interaction.response.send_message("ℹ️ Aucun match trouvé pour ce deck (dans la ligue ouverte).")
+        return await interaction.response.send_message("ℹ️ Aucun match trouvé pour ce deck.")
 
     wins = int(stats["wins"] or 0)
     losses = int(stats["losses"] or 0)
     draws = int(stats["draws"] or 0)
-    winrate = (wins / games * 100) if games > 0 else 0.0
+    winrate = (wins / games * 100) if games else 0.0
 
     matchup_rows = await db_all(
         bot.db,
@@ -908,16 +1032,14 @@ async def deck_stats(interaction: discord.Interaction, deck: str):
         (league["id"], deck, league["id"], deck),
     )
 
-    if matchup_rows:
-        matchup_text = "\n".join(
-            f"• vs **{r['opp_deck']}** — {r['wins']}W/{r['draws']}D/{r['losses']}L (sur {r['games']})"
-            for r in matchup_rows
-        )
-    else:
-        matchup_text = "• (pas assez de données pour des matchups)"
+    matchup_text = (
+        "\n".join(f"• vs **{r['opp_deck']}** — {r['wins']}W/{r['draws']}D/{r['losses']}L (sur {r['games']})" for r in matchup_rows)
+        if matchup_rows else
+        "• (pas assez de données pour des matchups)"
+    )
 
     await interaction.response.send_message(
-        f"🃏 **Stats deck: {deck}**\n"
+        f"🃏 **Stats deck — {fmt}** : **{deck}**\n"
         f"• Matchs: **{games}**\n"
         f"• Bilan: **{wins}W / {draws}D / {losses}L**\n"
         f"• Winrate: **{winrate:.1f}%**\n\n"
@@ -925,12 +1047,13 @@ async def deck_stats(interaction: discord.Interaction, deck: str):
         f"{matchup_text}"
     )
 
-@bot.tree.command(name="deck_matchups", description="Résultats entre 2 decks")
-@app_commands.autocomplete(deck_a=deck_autocomplete, deck_b=deck_autocomplete)
-async def deck_matchups(interaction: discord.Interaction, deck_a: str, deck_b: str):
-    league = await get_open_league(interaction.guild_id)
+@bot.tree.command(name="deck_matchups", description="Matchup entre 2 decks (par format)")
+@app_commands.autocomplete(format=format_autocomplete, deck_a=deck_autocomplete, deck_b=deck_autocomplete)
+async def deck_matchups(interaction: discord.Interaction, format: str, deck_a: str, deck_b: str):
+    fmt = normalize_format(format)
+    league = await get_open_league(interaction.guild_id, fmt)
     if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
 
     deck_a = deck_a.strip()
     deck_b = deck_b.strip()
@@ -964,7 +1087,7 @@ async def deck_matchups(interaction: discord.Interaction, deck_a: str, deck_b: s
 
     games = int(rows["games"] or 0)
     if games == 0:
-        return await interaction.response.send_message("ℹ️ Aucun match entre ces deux decks (dans la ligue ouverte).")
+        return await interaction.response.send_message("ℹ️ Aucun match entre ces deux decks.")
 
     a_wins = int(rows["a_wins"] or 0)
     b_wins = int(rows["b_wins"] or 0)
@@ -974,7 +1097,7 @@ async def deck_matchups(interaction: discord.Interaction, deck_a: str, deck_b: s
     b_winrate = (b_wins / games * 100) if games else 0.0
 
     await interaction.response.send_message(
-        f"🆚 **Matchup**\n"
+        f"🆚 **Matchup — {fmt}**\n"
         f"**{deck_a}** vs **{deck_b}**\n"
         f"• Matchs: **{games}**\n"
         f"• {deck_a}: **{a_wins}W** ({a_winrate:.1f}%)\n"
@@ -983,7 +1106,7 @@ async def deck_matchups(interaction: discord.Interaction, deck_a: str, deck_b: s
     )
 
 # =========================
-# Slash commands: Exports CSV
+# Exports CSV (per format)
 # =========================
 def _csv_file(filename: str, rows: list[dict]) -> discord.File:
     output = io.StringIO()
@@ -996,33 +1119,36 @@ def _csv_file(filename: str, rows: list[dict]) -> discord.File:
     data = output.getvalue().encode("utf-8")
     return discord.File(fp=io.BytesIO(data), filename=filename)
 
-@bot.tree.command(name="export_matches", description="Exporter les matchs en CSV (admin)")
+@bot.tree.command(name="export_matches", description="Exporter les matchs CSV (admin, par format)")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def export_matches(interaction: discord.Interaction):
-    league = await get_open_league(interaction.guild_id)
+@app_commands.autocomplete(format=format_autocomplete)
+async def export_matches(interaction: discord.Interaction, format: str):
+    fmt = normalize_format(format)
+    league = await get_open_league(interaction.guild_id, fmt)
     if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
 
     rows = await db_all(
         bot.db,
         """
-        SELECT id, created_at, result, p1, p2, p1_deck, p2_deck
+        SELECT id, created_at, result, p1, p2, p1_deck, p2_deck, format
         FROM matches
         WHERE league_id=?
         ORDER BY id ASC
         """,
         (league["id"],),
     )
-    dict_rows = [dict(r) for r in rows]
-    file = _csv_file("matches.csv", dict_rows)
-    await interaction.response.send_message("📤 Export des matchs :", file=file)
+    file = _csv_file(f"matches_{fmt}.csv", [dict(r) for r in rows])
+    await interaction.response.send_message(f"📤 Export des matchs — **{fmt}** :", file=file)
 
-@bot.tree.command(name="export_standings", description="Exporter le classement en CSV (admin)")
+@bot.tree.command(name="export_standings", description="Exporter le classement CSV (admin, par format)")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def export_standings(interaction: discord.Interaction):
-    league = await get_open_league(interaction.guild_id)
+@app_commands.autocomplete(format=format_autocomplete)
+async def export_standings(interaction: discord.Interaction, format: str):
+    fmt = normalize_format(format)
+    league = await get_open_league(interaction.guild_id, fmt)
     if not league:
-        return await interaction.response.send_message("❌ Aucune ligue ouverte", ephemeral=True)
+        return await interaction.response.send_message("❌ Aucun tournoi ouvert pour ce format.", ephemeral=True)
 
     rows = await db_all(
         bot.db,
@@ -1034,10 +1160,45 @@ async def export_standings(interaction: discord.Interaction):
         """,
         (league["id"],),
     )
-    dict_rows = [dict(r) for r in rows]
-    file = _csv_file("standings.csv", dict_rows)
-    await interaction.response.send_message("📤 Export du classement :", file=file)
+    file = _csv_file(f"standings_{fmt}.csv", [dict(r) for r in rows])
+    await interaction.response.send_message(f"📤 Export du classement — **{fmt}** :", file=file)
+@bot.tree.command(name="league_list_open", description="Lister les tournois ouverts (tous formats)")
+async def league_list_open(interaction: discord.Interaction):
+    rows = await db_all(
+        bot.db,
+        """
+        SELECT id, name, format
+        FROM leagues
+        WHERE guild_id=? AND status='open'
+        ORDER BY format ASC, id DESC
+        """,
+        (str(interaction.guild_id),)
+    )
 
+    if not rows:
+        return await interaction.response.send_message("ℹ️ Aucun tournoi ouvert pour l’instant.")
+
+    lines = []
+    for r in rows:
+        league_id = r["id"]
+        fmt = r["format"] or "?"
+        name = r["name"] or "(sans nom)"
+
+        players_count = await db_one(bot.db, "SELECT COUNT(*) AS c FROM players WHERE league_id=?", (league_id,))
+        matches_count = await db_one(bot.db, "SELECT COUNT(*) AS c FROM matches WHERE league_id=?", (league_id,))
+        last_match = await db_one(
+            bot.db,
+            "SELECT created_at, result, p1, p2 FROM matches WHERE league_id=? ORDER BY id DESC LIMIT 1",
+            (league_id,)
+        )
+
+        info = f"👥 {players_count['c']} | 🧾 {matches_count['c']}"
+        if last_match and last_match["created_at"]:
+            info += f" | ⏱️ <t:{last_match['created_at']}:R>"
+
+        lines.append(f"🎮 **{fmt}** — **{name}**\n{info}")
+
+    await interaction.response.send_message("🏁 **Tournois ouverts**\n\n" + "\n\n".join(lines))
 # =========================
 # Run
 # =========================
