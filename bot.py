@@ -1206,6 +1206,13 @@ async def admin_clear_guild_commands(interaction: discord.Interaction):
     bot.tree.clear_commands(guild=guild)   # supprime les commandes "guild"
     await bot.tree.sync(guild=guild)       # applique la suppression
     await interaction.response.send_message("✅ Commandes *serveur* supprimées. Redeploy ensuite pour resync propre.")
+    @bot.tree.command(name="admin_clear_guild_commands", description="Supprimer toutes les slash du serveur (admin)")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def admin_clear_guild_commands(interaction: discord.Interaction):
+    guild = discord.Object(id=interaction.guild_id)
+    bot.tree.clear_commands(guild=guild)   # supprime les commandes "guild"
+    await bot.tree.sync(guild=guild)       # applique la suppression
+    await interaction.response.send_message("✅ Commandes *serveur* supprimées. Redeploy ensuite pour resync propre.")
 # =========================
 # Run
 # =========================
