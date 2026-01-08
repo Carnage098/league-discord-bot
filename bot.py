@@ -164,6 +164,48 @@ class LeagueBot(commands.Bot):
 bot = LeagueBot()
 
 # =========================
+# Admin guard + error handler (AJOUT)
+# =========================
+def require_admin():
+    async def predicate(interaction: discord.Interaction):
+        # Bloque en DM
+        if interaction.guild is None or interaction.guild_id is None:
+            raise app_commands.CheckFailure("Commande utilisable uniquement sur un serveur.")
+
+        # Vérif permission ADMINISTRATOR
+        if isinstance(interaction.user, discord.Member):
+            if interaction.user.guild_permissions.administrator:
+                return True
+        else:
+            member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+            if member and member.guild_permissions.administrator:
+                return True
+
+        raise app_commands.CheckFailure("❌ Admin uniquement.")
+    return app_commands.check(predicate)
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # message propre quand un check bloque
+    if isinstance(error, app_commands.CheckFailure):
+        msg = str(error) if str(error) else "❌ Permission refusée."
+        if interaction.response.is_done():
+            return await interaction.followup.send(msg, ephemeral=True)
+        return await interaction.response.send_message(msg, ephemeral=True)
+
+    # autres erreurs : log + message générique
+    print("❌ AppCommandError:", repr(error), flush=True)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("⚠️ Une erreur est survenue.", ephemeral=True)
+        else:
+            await interaction.response.send_message("⚠️ Une erreur est survenue.", ephemeral=True)
+    except Exception:
+        pass
+
+
+# =========================
 # Helpers
 # =========================
 def normalize_format(fmt: str) -> str:
@@ -176,9 +218,7 @@ def normalize_format(fmt: str) -> str:
 
 async def format_autocomplete(interaction: discord.Interaction, current: str):
     cur = (current or "").lower().strip()
-    return [
-        app_commands.Choice(name=f, value=f) for f in FORMATS if cur in f.lower()
-    ][:25]
+    return [app_commands.Choice(name=f, value=f) for f in FORMATS if cur in f.lower()][:25]
 
 
 async def get_open_league(guild_id: int, fmt: str):
@@ -427,7 +467,7 @@ async def _auto_victoire_de(interaction: discord.Interaction, current: str):
 # Commands: League management
 # =========================
 @bot.tree.command(name="league_create", description="Créer et ouvrir un tournoi (admin)")
-@app_commands.checks.has_permissions(manage_guild=True)
+@require_admin()
 @app_commands.autocomplete(format=format_autocomplete)
 async def league_create(interaction: discord.Interaction, name: str, format: str):
     fmt = normalize_format(format)
@@ -449,7 +489,7 @@ async def league_create(interaction: discord.Interaction, name: str, format: str
 
 
 @bot.tree.command(name="league_close", description="Fermer le tournoi d'un format (admin)")
-@app_commands.checks.has_permissions(manage_guild=True)
+@require_admin()
 @app_commands.autocomplete(format=format_autocomplete)
 async def league_close(interaction: discord.Interaction, format: str):
     fmt = normalize_format(format)
@@ -545,7 +585,7 @@ async def leaveleague(interaction: discord.Interaction, format: str):
 # Commands: Deck directory
 # =========================
 @bot.tree.command(name="deck_add", description="Ajouter un deck au répertoire (admin, par format)")
-@app_commands.checks.has_permissions(manage_guild=True)
+@require_admin()
 @app_commands.autocomplete(format=format_autocomplete)
 async def deck_add(interaction: discord.Interaction, format: str, name: str):
     fmt = normalize_format(format)
@@ -565,7 +605,7 @@ async def deck_add(interaction: discord.Interaction, format: str, name: str):
 
 
 @bot.tree.command(name="deck_remove", description="Supprimer un deck (admin, par format)")
-@app_commands.checks.has_permissions(manage_guild=True)
+@require_admin()
 @app_commands.autocomplete(format=format_autocomplete, name=deck_autocomplete)
 async def deck_remove(interaction: discord.Interaction, format: str, name: str):
     fmt = normalize_format(format)
@@ -901,7 +941,7 @@ async def league_history(interaction: discord.Interaction, format: str, nombre: 
 
 
 @bot.tree.command(name="league_undo_last", description="Annuler le dernier match (admin, par format)")
-@app_commands.checks.has_permissions(manage_guild=True)
+@require_admin()
 @app_commands.autocomplete(format=format_autocomplete)
 async def league_undo_last(interaction: discord.Interaction, format: str):
     fmt = normalize_format(format)
@@ -941,7 +981,7 @@ async def league_undo_last(interaction: discord.Interaction, format: str):
 
 
 @bot.tree.command(name="admin_reset_league", description="Reset tournoi (admin, par format)")
-@app_commands.checks.has_permissions(manage_guild=True)
+@require_admin()
 @app_commands.autocomplete(format=format_autocomplete)
 async def admin_reset_league(interaction: discord.Interaction, format: str):
     fmt = normalize_format(format)
@@ -1079,7 +1119,7 @@ def _csv_file(filename: str, rows: list[dict]) -> discord.File:
 
 
 @bot.tree.command(name="export_matches", description="Exporter les matchs CSV (admin, par format)")
-@app_commands.checks.has_permissions(manage_guild=True)
+@require_admin()
 @app_commands.autocomplete(format=format_autocomplete)
 async def export_matches(interaction: discord.Interaction, format: str):
     fmt = normalize_format(format)
@@ -1102,7 +1142,7 @@ async def export_matches(interaction: discord.Interaction, format: str):
 
 
 @bot.tree.command(name="export_standings", description="Exporter le classement CSV (admin, par format)")
-@app_commands.checks.has_permissions(manage_guild=True)
+@require_admin()
 @app_commands.autocomplete(format=format_autocomplete)
 async def export_standings(interaction: discord.Interaction, format: str):
     fmt = normalize_format(format)
@@ -1167,7 +1207,7 @@ async def league_list_open(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="admin_clear_all_commands", description="Supprimer toutes les slash (global + serveur) (admin)")
-@app_commands.checks.has_permissions(manage_guild=True)
+@require_admin()
 async def admin_clear_all_commands(interaction: discord.Interaction):
     guild = discord.Object(id=interaction.guild_id)
 
@@ -1181,7 +1221,8 @@ async def admin_clear_all_commands(interaction: discord.Interaction):
 
     await interaction.response.send_message(
         "✅ Nettoyage fait : commandes serveur + global supprimées.\n"
-        "➡️ Redeploy ensuite pour resync propre."
+        "➡️ Redeploy ensuite pour resync propre.",
+        ephemeral=True,
     )
 
 
@@ -1189,4 +1230,3 @@ async def admin_clear_all_commands(interaction: discord.Interaction):
 # Run
 # =========================
 bot.run(TOKEN)
-
